@@ -1,4 +1,4 @@
-# cs136_final
+# Course Schedule Generator
 
 This project is an interactive tool for generating a four-year academic plan for Williams College students, with a strong focus on Computer Science (CS) course sequencing. It takes into account prerequisites, semester availability, course load limits, and graduation requirements. The tool was developed by Jane Su and Jose Miguel as the final project for CS136.
 
