@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Eye & Head Combined Gaze — MediaPipe Tasks FaceLandmarker</title>
+
+<style>
+  /* ------- THEME & LAYOUT ------- */
+  :root{
+    --bg:#0b1220; --panel:#121a2a; --text:#e6eefb; --accent:#7cc0ff; --good:#7CFF9C;
+    /* preview square size (tweakable) */
+    --preview-size: 26vh;    /* try 22–30vh depending on your screen */
+    --preview-min: 220px;
+    --preview-max: 340px;
+  }
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+
+  /* Overlay hosts cursor + dwell ring visuals (not clickable) */
+  #overlay{ position:fixed; inset:0; pointer-events:none; z-index:9999; }
+
+  /* Gaze cursor + dwell progress ring */
+  #cursor{ position:fixed; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:999px; background:var(--accent); box-shadow:0 0 0 4px rgba(124,192,255,.25); }
+  #ring,#ringFill{ position:fixed; width:42px; height:42px; margin:-21px 0 0 -21px; border-radius:999px; }
+  #ring{border:3px solid rgba(255,255,255,.15)}
+  #ringFill{box-shadow:0 0 0 3px var(--good) inset; clip-path: conic-gradient(var(--good) 0deg, transparent 0deg)}
+
+  /* Calibration target dots */
+  .calibDot{ position:absolute; width:18px; height:18px; margin:-9px 0 0 -9px; border-radius:50%; background:#FFD37C; box-shadow:0 0 0 6px rgba(255,211,124,.2) }
+
+  /* On-screen keyboard (bottom) */
+  #keyboard{ position:fixed; left:0; right:0; bottom:0; background:#0f172a; border-top:1px solid #1f2a42; display:grid; grid-template-columns:repeat(10,1fr); gap:8px; padding:12px; z-index:8000; }
+  .key{ user-select:none; display:flex; align-items:center; justify-content:center; height:56px; border-radius:12px; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; font-weight:600 }
+  .key.big{grid-column:span 2}.key.extra{grid-column:span 3}.key.active{outline:2px solid var(--accent)}
+  .key.candidate{ outline:2px dashed var(--good); }
+
+  /* Status pill (top-right) */
+  #status{ position:fixed; right:12px; top:12px; background:#121a2a; border:1px solid #203059; padding:8px 10px; border-radius:8px; z-index:10000}
+
+  /* Hide only internal nodes; preview stays visible */
+  #cam,#proc{display:none}
+
+  /* Typed output */
+  #typedBox{position:fixed; left:12px; right:12px; top:60px; background:#0f172a;
+    border:1px solid #203059; padding:10px 12px; border-radius:10px; min-height:40px;
+    font-size:18px; letter-spacing:.5px; white-space:pre-wrap; z-index:10000}
+  #caret{opacity:.7; margin-left:2px; animation:blink .9s step-end infinite}
+  @keyframes blink { 50% { opacity:0 } }
+
+  /* Prediction bar (above keyboard) */
+  #predictBar{ position:fixed; left:12px; right:12px; background:#0f172a; border:1px solid #203059;
+    padding:8px; border-radius:10px; display:grid; grid-template-columns:repeat(3,1fr); gap:8px; z-index:10000 }
+  #predictBar .key{ height:88px; font-weight:600; }
+
+  /* WebAudio unlock button */
+  #soundBtn{ position:fixed; left:12px; top:12px; z-index:10001; background:#16203a; color:#cfe3ff; border:1px solid #263a6b; border-radius:8px; padding:6px 10px; cursor:pointer }
+
+  /* === PREVIEW: square to the right of center (doesn't cover keyboard) === */
+  #previewDock{
+    position: fixed;
+    right: 16px;                /* offset from right edge */
+    top: 30%;                   /* ~center, 30% from top */
+    transform: translateY(-50%);
+    width: clamp(var(--preview-min), var(--preview-size), var(--preview-max));
+    height: clamp(var(--preview-min), var(--preview-size), var(--preview-max));
+    z-index: 2000;              /* below overlay/cursor, above background */
+    pointer-events: none;       /* does not block UI */
+    background:#0b1220;
+    border:1px solid #243b6b;
+    border-radius:12px;
+    box-shadow:0 10px 30px rgba(0,0,0,.35);
+    display:grid; place-items:center;
+  }
+  #preview{
+    width: 100%; height: 100%;
+    display:block; border-radius:10px; background:#020617;
+  }
+
+  /* If screen height is small: shrink preview to avoid overlaps */
+  @media (max-height: 720px){
+    :root{ --preview-size: 24vh; --preview-max: 320px; }
+  }
+  @media (max-height: 640px){
+    :root{ --preview-size: 22vh; --preview-max: 300px; }
+  }
+</style>
+</head>
+
+<body>
+  <!-- Hidden media nodes: webcam feed + processing canvas -->
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="proc" width="640" height="480"></canvas>
+
+  <!-- Visible PREVIEW -->
+  <div id="previewDock">
+    <canvas id="preview" width="320" height="320"></canvas>
+  </div>
+
+  <!-- Visual overlay (cursor + dwell ring) -->
+  <div id="overlay">
+    <div id="cursor"></div>
+    <div id="ring"></div>
+    <div id="ringFill"></div>
+  </div>
+
+  <!-- UI -->
+  <div id="predictBar" aria-label="Predictions"></div>
+  <div id="keyboard"></div>
+  <div id="status">Status: <span id="statTxt">loading model…</span></div>
+  <div id="typedBox"><span id="typedText"></span><span id="caret">|</span></div>
+  <button id="soundBtn" title="Enable Sound">🔊 sound</button>
+
+<script type="module">
+/* -------------------------------------------------------------
+   1) IMPORT MEDIAPIPE TASKS
+   ------------------------------------------------------------- */
+const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3');
+const { FaceLandmarker, FilesetResolver } = vision;
+
+/* -------------------------------------------------------------
+   2) DOM ELEMENTS & STATE
+   ------------------------------------------------------------- */
+const cam = document.getElementById('cam');
+const proc = document.getElementById('proc');
+const ctx  = proc.getContext('2d');
+const cursor = document.getElementById('cursor');
+const ring = document.getElementById('ring');
+const ringFill = document.getElementById('ringFill');
+const statTxt = document.getElementById('statTxt');
+const keyboard = document.getElementById('keyboard');
+const predictBar = document.getElementById('predictBar');
+const soundBtn = document.getElementById('soundBtn');
+const typedTextEl = document.getElementById('typedText');
+const preview = document.getElementById('preview');
+const pctx = preview.getContext('2d');
+
+let typedBuffer = '';
+function renderTyped(){ typedTextEl.textContent = typedBuffer; }
+const wait = ms=>new Promise(r=>setTimeout(r,ms));
+
+/* ====== PREVIEW OPTIONS ====== */
+let SHOW_EYE_TRACKERS = true; // ← draws eye contours + irises
+
+/* ====== CURSOR VERTICAL OFFSET (raises cursor on Y) ====== */
+let GAZE_Y_LIFT_PX = Number(localStorage.getItem('gazeYOffset') || 120);
+
+/* Drawing helpers for preview */
+function drawPoint(ctx,x,y,r=3, color='#7cc0ff'){
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle=color; ctx.fill();
+}
+function drawPath(ctx, pts, close=false, w=2, color='#7cc0ff'){
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (close) ctx.closePath();
+  ctx.lineWidth = w;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+/* -------------------------------------------------------------
+   3) KEYBOARD
+   ------------------------------------------------------------- */
+const LAYOUT = ['QWERTYUIOP','ASDFGHJKL','ZXCVBNM'];
+function buildKeyboard(){
+  keyboard.innerHTML='';
+  for(const ch of LAYOUT[0]) addKey(ch);
+  const spacer = document.createElement('div'); spacer.style.opacity=0; keyboard.appendChild(spacer);
+  for(const ch of LAYOUT[1]) addKey(ch);
+  const spacer2 = document.createElement('div'); spacer2.style.opacity=0; keyboard.appendChild(spacer2);
+  for(const ch of LAYOUT[2]) addKey(ch);
+  addKey('SPACE','extra'); addKey('BKSP','big'); addKey('ENTER','big');
+  positionPredictBar();
+}
+function addKey(label, cls=''){
+  const d=document.createElement('div');
+  d.className='key '+cls;
+  d.dataset.label=label;
+  d.textContent=label;
+  keyboard.appendChild(d);
+}
+buildKeyboard();
+
+const COMMON_WORDS = [ "the","to","and","you","that","was","for","are","with","have","this","not","but","they","his","her","she","from","had","say","who","about","would","there","their","what","when","which","can","more","if","do","will","so","no","we","one","all","out","up","as","on","in","at","it","is","be","of","or","by","an","he","me","my","your","our","like","time","just","know","good","people","now","new","into","over","back","only","other","than","first","day","how","make","take","look","use","work","even","want","because","any","could","should","very","also","between","after","before","again","little","great","right","left","top","bottom","yes","no" ];
+function positionPredictBar(){
+  const kbRect = keyboard.getBoundingClientRect();
+  const bottomOffset = window.innerHeight - kbRect.top + 8;
+  predictBar.style.bottom = bottomOffset + 'px';
+}
+window.addEventListener('resize', positionPredictBar);
+function lastToken(){ const m = typedBuffer.match(/([A-Za-z]+)$/); return m ? m[1] : ''; }
+function updatePredictions(){
+  predictBar.innerHTML = '';
+  const token = lastToken().toLowerCase();
+  const picks = token.length >= 1 ? COMMON_WORDS.filter(w=>w.startsWith(token)).slice(0,3) : COMMON_WORDS.slice(0,3);
+  for(const w of picks){
+    const el = document.createElement('div');
+    el.className = 'key pred';
+    el.dataset.type = 'word';
+    el.dataset.label = w;
+    el.textContent = w;
+    predictBar.appendChild(el);
+  }
+}
+
+/* -------------------------------------------------------------
+   4) AUDIO (optional)
+   ------------------------------------------------------------- */
+let audioCtx = null;
+soundBtn.addEventListener('click', ()=>{
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    statTxt.textContent = 'sound on ✓';
+  }catch(e){ statTxt.textContent = 'sound blocked'; }
+});
+function beep(freq=660, dur=0.06, vol=0.06){
+  if(!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.value = freq; osc.type = 'sine';
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(vol, t0+0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0); osc.stop(t0+dur+0.02);
+}
+function keyClickSound(){ beep(720, 0.06, 0.07); }
+function wordClickSound(){ beep(480, 0.10, 0.09); }
+
+/* -------------------------------------------------------------
+   5) DWELL + SNAP (better “grip” onto a key)
+   ------------------------------------------------------------- */
+const DWELL_MS = 1000;
+const ENABLE_DWELL_SELECT = true;
+const DWELL_STABILITY_PX = 18;   // ↓ stricter = less micro-movement
+const DWELL_RESET_DRIFT_PX = 28; // ↓ easier to restart if you move
+const DWELL_COOLDOWN_MS = 600;
+let dwellCooldownUntil = 0;
+let dwellAnchor = null;
+
+let hoverKey=null, hoverStart=0;
+/* ↑ More “glue” to the key */
+const SNAP_RADIUS = 28, MAGNET_RADIUS_KEY=110, MAGNET_RADIUS_WORD=160, RELEASE_FACTOR=1.3;
+
+function centerDist(el, x, y){
+  const r = el.getBoundingClientRect();
+  const cx = (r.left+r.right)/2, cy = (r.top+r.bottom)/2;
+  const d = Math.hypot(x-cx, y-cy);
+  return {cx, cy, d};
+}
+function findNearestKey(x,y, R, biasWords=true){
+  let best=null, bestScore=Infinity, bestRaw=Infinity;
+  const els = document.querySelectorAll('.key');
+  for(const k of els){
+    const {d} = centerDist(k, x, y);
+    const bias = (biasWords && k.dataset.type==='word') ? 0.7 : 1.0;
+    const score = d * bias;
+    if (score < bestScore){ bestScore = score; bestRaw = d; best = k; }
+  }
+  return (R==null || bestRaw<=R) ? best : null;
+}
+let snappedEl = null;
+function snapPoint(x, y){
+  let cand = findNearestKey(x, y, null, true);
+  let resultX = x, resultY = y;
+  if (snappedEl){
+    const {d:sd} = centerDist(snappedEl, x, y);
+    const sRad = (snappedEl.dataset.type==='word') ? MAGNET_RADIUS_WORD : MAGNET_RADIUS_KEY;
+    if (sd > sRad * RELEASE_FACTOR){ snappedEl = null; } else { cand = snappedEl; }
+  }
+  if (!snappedEl && cand){
+    const {cx, cy, d} = centerDist(cand, x, y);
+    const rad = (cand.dataset.type==='word') ? MAGNET_RADIUS_WORD : MAGNET_RADIUS_KEY;
+    if (d <= rad){ snappedEl = cand; resultX = cx; resultY = cy; }
+  }
+  if (snappedEl){
+    const {cx, cy} = centerDist(snappedEl, x, y);
+    resultX = cx; resultY = cy;
+  }
+  return { sx: resultX, sy: resultY, el: snappedEl || cand };
+}
+function selectKey(k){
+  const isWord = k.dataset.type === 'word';
+  const label = k.dataset.label;
+  if (isWord){
+    const m = typedBuffer.match(/^(.*?)([A-Za-z]+)?$/s);
+    const head = m ? (m[1] || '') : typedBuffer;
+    typedBuffer = head + label + ' ';
+    renderTyped(); updatePredictions();
+    statTxt.textContent = `Word: ${label}`; wordClickSound();
+    return;
+  }
+  if (label === 'SPACE')      { typedBuffer += ' ';   statTxt.textContent = 'Inserted: ␣'; }
+  else if (label === 'BKSP')  { typedBuffer = typedBuffer.slice(0, -1); statTxt.textContent = 'Backspace ⌫'; }
+  else if (label === 'ENTER') { typedBuffer += '\n';  statTxt.textContent = 'Inserted: ↵'; }
+  else                        { typedBuffer += label; statTxt.textContent = `Inserted: ${label}`; }
+  renderTyped(); updatePredictions(); keyClickSound();
+}
+function setCursor(x,y,p=0){
+  cursor.style.left=x+'px'; cursor.style.top=y+'px';
+  ring.style.left=x+'px';   ring.style.top=y+'px';
+  ringFill.style.left=x+'px'; ringFill.style.top=y+'px';
+  ringFill.style.clipPath = `conic-gradient(var(--good) ${Math.round(p*360)}deg, transparent 0deg)`;
+}
+function updateDwell(xs, ys){
+  const { sx, sy } = snapPoint(xs, ys);
+  const nearest = findNearestKey(sx, sy, SNAP_RADIUS, true);
+  if (nearest !== hoverKey){
+    if(hoverKey) hoverKey.classList.remove('active');
+    hoverKey   = nearest;
+    hoverStart = nearest ? performance.now() : 0;
+    dwellAnchor = nearest ? { x: sx, y: sy } : null;
+    setCursor(sx, sy, 0);
+    if(hoverKey) hoverKey.classList.add('active');
+    return;
+  }
+  if (!hoverKey) { setCursor(sx, sy, 0); return; }
+  const drift = dwellAnchor ? Math.hypot(sx - dwellAnchor.x, sy - dwellAnchor.y) : Infinity;
+  if (drift > DWELL_RESET_DRIFT_PX) {
+    dwellAnchor = { x: sx, y: sy };
+    hoverStart  = performance.now();
+    setCursor(sx, sy, 0);
+    return;
+  }
+  const now = performance.now();
+  const allowProgress = (drift <= DWELL_STABILITY_PX) && (now >= dwellCooldownUntil);
+  const p = allowProgress ? Math.min(1, (now - hoverStart) / DWELL_MS) : 0;
+  setCursor(sx, sy, p);
+  if (p >= 1) {
+    if (ENABLE_DWELL_SELECT) {
+      selectKey(hoverKey);
+      dwellCooldownUntil = performance.now() + DWELL_COOLDOWN_MS;
+    } else {
+      setBlinkCandidate(hoverKey);
+    }
+    hoverKey?.classList.remove('active');
+    hoverKey = null; hoverStart = 0; dwellAnchor = null;
+    setCursor(sx, sy, 0);
+  }
+}
+
+/* -------------------------------------------------------------
+   6) FILTERS (smoother and split X/Y)
+   ------------------------------------------------------------- */
+class OneEuro {
+  constructor(minCutoff=0.8, beta=0.003, dCutoff=1.0, freq=60){
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.freq=freq;
+    this.xPrev=null; this.dxPrev=0; this.tPrev=null;
+  }
+  alpha(cutoff){ const te=1.0/this.freq; const r=2*Math.PI*cutoff*te; return r/(r+1); }
+  update(x){
+    const now=performance.now();
+    const dt=this.tPrev? (now-this.tPrev)/1000 : 1/this.freq; this.tPrev=now;
+    const aD=this.alpha(this.dCutoff);
+    const dx = (this.xPrev!=null)? Math.abs(x-this.xPrev) / dt : 0;
+    const dxHat = aD*dx + (1-aD)*this.dxPrev; this.dxPrev=dxHat;
+    const cutoff = this.minCutoff + this.beta*dxHat;
+    const a = this.alpha(cutoff);
+    const xHat = (this.xPrev!=null)? a*x + (1-a)*this.xPrev : x;
+    this.xPrev = xHat; return xHat;
+  }
+}
+const filterX = new OneEuro(0.8, 0.003, 1.0, 60); // horizontal
+const filterY = new OneEuro(0.7, 0.002, 1.0, 60); // vertical slightly softer
+
+/* -------------------------------------------------------------
+   7) CALIBRATION
+   ------------------------------------------------------------- */
+const calibPairs=[];
+const targets=[[0.1,0.1],[0.5,0.1],[0.9,0.1],[0.1,0.5],[0.5,0.5],[0.9,0.5],[0.1,0.9],[0.5,0.9],[0.9,0.9]];
+const margin=40;
+const pxX = tx=> margin + tx*(innerWidth-2*margin);
+const pxY = ty=> margin + ty*(innerHeight-2*margin);
+function showDotAt(tx,ty){
+  const x=pxX(tx), y=pxY(ty);
+  const d=document.createElement('div'); d.className='calibDot';
+  d.style.left=x+'px'; d.style.top=y+'px'; overlay.appendChild(d);
+  return {x,y,el:d};
+}
+let theta=null;
+const phi = ([a,b])=> [1,a,b,a*a,a*b,b*b];
+function fitMapping(pairs){
+  const Phi=pairs.map(p=>phi(p.u)), Y=pairs.map(p=>p.v);
+  const d=6, m=Phi.length, A=Array.from({length:d},()=>Array(d).fill(0)), B=Array.from({length:d},()=>Array(2).fill(0));
+  for(let i=0;i<m;i++){ const ph=Phi[i], y=Y[i];
+    for(let r=0;r<d;r++){ for(let c=0;c<d;c++) A[r][c]+= ph[r]*ph[c]; B[r][0]+= ph[r]*y[0]; B[r][1]+= ph[r]*y[1]; } }
+  function solve(col){ const n=d, M=A.map((row,i)=>row.slice().concat(B[i][col]));
+    for(let i=0;i<n;i++){ let piv=i; for(let r=i+1;r<n;r++) if(Math.abs(M[r][i])>Math.abs(M[piv][i])) piv=r;
+      [M[i],M[piv]]=[M[piv],M[i]]; const div=M[i][i]||1e-9; for(let c=i;c<=n;c++) M[i][c]/=div;
+      for(let r=0;r<n;r++){ if(r===i) continue; const f=M[r][i]; for(let c=i;c<=n;c++) M[r][c]-=f*M[i][c]; } }
+    return M.map(row=>row[n]); }
+  theta=[solve(0), solve(1)];
+  localStorage.setItem('calibTheta', JSON.stringify(theta));
+}
+function mapToScreen(u){
+  if(!theta){
+    const cx=innerWidth*0.5, cy=innerHeight*0.5; return [cx + u[0]*220, cy + u[1]*220];
+  }
+  const p=phi(u);
+  const x=p.reduce((s,v,i)=>s+v*theta[0][i],0), y=p.reduce((s,v,i)=>s+v*theta[1][i],0);
+  return [x,y];
+}
+async function runCalibration(){
+  statTxt.textContent='calibrating…';
+  const S=30, dt=60;
+  for(const [tx,ty] of targets){
+    const dot=showDotAt(tx,ty); await wait(400);
+    for(let i=0;i<S;i++){ if(lastU) calibPairs.push({u:lastU.slice(), v:[dot.x,dot.y]}); await wait(dt); }
+    dot.el.remove(); await wait(120);
+  }
+  fitMapping(calibPairs);
+  statTxt.textContent='running (calibrated ✓)';
+  localStorage.setItem('calibrated','1');
+}
+window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
+
+/* -------------------------------------------------------------
+   8) CAMERA
+   ------------------------------------------------------------- */
+const constraints = { video: { facingMode: 'user', width: 640, height: 480 } };
+const startCamera = async ()=>{
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  cam.srcObject = stream;
+  await cam.play();
+  if(!cam.videoWidth || !cam.videoHeight){
+    await new Promise(res => cam.addEventListener('loadedmetadata', res, { once:true }));
+  }
+  cam.style.display='block';
+  cam.style.position='fixed';
+  cam.style.left='0'; cam.style.top='0';
+  cam.style.width='1px'; cam.style.height='1px'; cam.style.opacity='0';
+  cam.style.transform='scaleX(-1)';
+  proc.width = cam.videoWidth || 640;
+  proc.height = cam.videoHeight || 480;
+
+  /* internal square preview for crisp rendering */
+  const side = 320;
+  preview.width  = side;
+  preview.height = side;
+
+  console.log('video dims:', cam.videoWidth, cam.videoHeight);
+};
+
+/* -------------------------------------------------------------
+   9) LANDMARKER
+   ------------------------------------------------------------- */
+let faceLandmarker=null, runningMode='VIDEO';
+async function loadLandmarker(){
+  const filesetResolver = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
+  );
+  faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+      delegate: 'GPU'
+    },
+    runningMode: runningMode,
+    numFaces: 1,
+    outputFaceBlendshapes: false,
+    outputFacialTransformationMatrixes: false
+  });
+}
+
+/* -------------------------------------------------------------
+   10) FEATURES / BLINK
+   ------------------------------------------------------------- */
+const IDX = { R_OUT:33,R_IN:133,L_OUT:362,L_IN:263, R_UP:159,R_LO:145,L_UP:386,L_LO:374, RIGHT_IRIS:[469,470,471,472], LEFT_IRIS:[474,475,476,477], NOSE:1 };
+function avgPts(landmarks, idxs){ let sx=0, sy=0, c=0; for(const i of idxs){ const p=landmarks[i]; if(p){ sx+=p.x; sy+=p.y; c++; } } return c ? {x:sx/c, y:sy/c} : {x:NaN, y:NaN}; }
+function computeCombinedFeature(landmarks){
+  const N = landmarks.length;
+  const Rc = (N>=478) ? avgPts(landmarks, IDX.RIGHT_IRIS) : avgPts(landmarks, [IDX.R_UP, IDX.R_LO]);
+  const Lc = (N>=478) ? avgPts(landmarks, IDX.LEFT_IRIS)  : avgPts(landmarks, [IDX.L_UP, IDX.L_LO]);
+  const Router = landmarks[IDX.R_OUT], Rinner = landmarks[IDX.R_IN];
+  const Louter = landmarks[IDX.L_OUT], Linner = landmarks[IDX.L_IN];
+  const Rmid = {x:(Router.x+Rinner.x)/2, y:(Router.y+Rinner.y)/2};
+  const Lmid = {x:(Louter.x+Linner.x)/2, y:(Louter.y+Linner.y)/2};
+  const Rw = Math.hypot(Router.x-Rinner.x, Router.y-Rinner.y) + 1e-6;
+  const Lw = Math.hypot(Louter.x-Linner.x, Louter.y-Linner.y) + 1e-6;
+  const Rup = landmarks[IDX.R_UP], Rlo = landmarks[IDX.R_LO];
+  const Lup = landmarks[IDX.L_UP], Llo = landmarks[IDX.L_LO];
+  const RmidY = (Rup.y + Rlo.y)/2, LmidY = (Lup.y + Llo.y)/2;
+  const Rh_raw = Math.abs(Rup.y - Rlo.y);
+  const Lh_raw = Math.abs(Lup.y - Llo.y);
+  const Rh = Math.max(Rh_raw, 0.25*Rw) + 1e-6;
+  const Lh = Math.max(Lh_raw, 0.25*Lw) + 1e-6;
+  const ux_eye = -((Rc.x - Rmid.x)/Rw + (Lc.x - Lmid.x)/Lw) * 0.5;
+  const uy_eye = ((Rc.y - RmidY)/Rh + (Lc.y - LmidY)/Lh) * 0.5;
+  const REc = {x:(Router.x+Rinner.x)/2, y:(Router.y+Rinner.y)/2};
+  const LEc = {x:(Louter.x+Linner.x)/2, y:(Louter.y+Linner.y)/2};
+  const eyeCenter = {x:(REc.x+LEc.x)/2, y:(REc.y+LEc.y)/2};
+  let minY=+Infinity, maxY=-Infinity, minX=+Infinity, maxX=-Infinity;
+  for(const p of landmarks){ if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; }
+  const faceH = Math.max(1e-6, maxY - minY);
+  const eyeSpan = Math.hypot(REc.x-LEc.x, REc.y-LEc.y) + 1e-6;
+  const nose = landmarks[IDX.NOSE] || eyeCenter;
+  let ux_head = (nose.x - eyeCenter.x)/eyeSpan;
+  let uy_head = (nose.y - eyeCenter.y)/faceH;
+  ux_head = -ux_head;
+  const ux = (1.4*ux_eye + 2*ux_head) * 8;
+  const uy = (-1.4*uy_eye + 1.4*uy_head) * 6;
+  return [ux, uy];
+}
+let BLINK_CONFIRM = false;
+let BLINK_LOW = 0.055, BLINK_HIGH = 0.085;
+const BLINK_MIN_MS=80, BLINK_MAX_MS=600, BLINK_COOLDOWN_MS=1000, BLINK_RANGE=380, EAR_FREEZE_XY=0.0950;
+let blinkState = { closed:false, t0:0, lastConfirm:0, cooldownUntil:0, justClosed:false };
+let pendingBlinkSelect = false, blinkCandidate = null;
+function computeEAR(lm){
+  const R_OUT=33, R_IN=133, R_UP=159, R_LO=145, L_OUT=362, L_IN=263, L_UP=386, L_LO=374;
+  const Router=lm[R_OUT], Rinner=lm[R_IN], Rup=lm[R_UP], Rlo=lm[R_LO];
+  const Louter=lm[L_OUT], Linner=lm[L_IN], Lup=lm[L_UP], Llo=lm[L_LO];
+  const Rw = Math.hypot(Router.x-Rinner.x, Router.y-Rinner.y) + 1e-6;
+  const Lw = Math.hypot(Louter.x-Linner.x, Louter.y-Linner.y) + 1e-6;
+  const gapR = Math.abs(Rup.y - Rlo.y) / Rw;
+  const gapL = Math.abs(Lup.y - Llo.y) / Lw;
+  return (gapR + gapL) * 0.5;
+}
+function setBlinkCandidate(el){
+  if (blinkCandidate === el) return;
+  if (blinkCandidate) blinkCandidate.classList.remove('candidate');
+  blinkCandidate = el;
+  if (blinkCandidate) blinkCandidate.classList.add('candidate');
+}
+let lastU=[0,0], lastVideoTime=-1;
+
+/* -------------------------------------------------------------
+   11) EYE RINGS / IRIS INDICES (for the “trackers”)
+   ------------------------------------------------------------- */
+const RIGHT_EYE_RING = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+const LEFT_EYE_RING  = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398];
+const RIGHT_IRIS = [469,470,471,472];
+const LEFT_IRIS  = [474,475,476,477];
+
+/* -------------------------------------------------------------
+   12) PREVIEW DRAW (video + optional trackers)
+   ------------------------------------------------------------- */
+let lastResults = null; // save last result for preview
+
+function drawToPreview(){
+  const vw = cam.videoWidth || 640, vh = cam.videoHeight || 480;
+  const cw = preview.width, ch = preview.height;   // square
+  const vr = vw / vh;                              // video aspect
+  const cr = cw / ch;                              // 1 (square)
+
+  let sw, sh, sx, sy; // source rect ("cover" crop)
+  if (vr > cr){
+    sh = vh;
+    sw = sh * cr;
+    sx = (vw - sw) / 2;
+    sy = 0;
+  } else {
+    sw = vw;
+    sh = sw / cr;
+    sx = 0;
+    sy = (vh - sh) / 2;
+  }
+
+  pctx.clearRect(0,0,cw,ch);
+
+  // horizontal mirror for selfie
+  pctx.save();
+  pctx.translate(cw, 0);
+  pctx.scale(-1, 1);
+
+  // 1) Draw camera frame
+  pctx.drawImage(cam, sx, sy, sw, sh, 0, 0, cw, ch);
+
+  // 2) Trackers
+  if (SHOW_EYE_TRACKERS && lastResults && lastResults.faceLandmarks && lastResults.faceLandmarks[0]){
+    const lm = lastResults.faceLandmarks[0];
+    const mapPt = (p) => {
+      const X = p.x * vw, Y = p.y * vh;
+      const cx = (X - sx) * (cw / sw);
+      const cy = (Y - sy) * (ch / sh);
+      return [cx, cy];
+    };
+    const rRing = RIGHT_EYE_RING.map(i => lm[i]).filter(Boolean).map(mapPt);
+    const lRing = LEFT_EYE_RING .map(i => lm[i]).filter(Boolean).map(mapPt);
+    pctx.globalAlpha = 0.95;
+    drawPath(pctx, rRing, true, 2, '#7cc0ff');
+    drawPath(pctx, lRing, true, 2, '#7cc0ff');
+
+    const rIris = RIGHT_IRIS.map(i => lm[i]).filter(Boolean).map(mapPt);
+    const lIris = LEFT_IRIS .map(i => lm[i]).filter(Boolean).map(mapPt);
+    pctx.globalAlpha = 1.0;
+    drawPath(pctx, rIris, true, 2, '#7CFF9C');
+    drawPath(pctx, lIris, true, 2, '#7CFF9C');
+  }
+
+  pctx.restore();
+}
+
+/* -------------------------------------------------------------
+   13) MAIN LOOP (with anti-jump on blink)
+   ------------------------------------------------------------- */
+let holdPos = {x: innerWidth/2, y: innerHeight/2}; // position frozen during blink
+let unfreezeUntil = 0;                              // smooth exit from blink
+const UNFREEZE_MS = 160;                            // ramp duration
+const MAX_STEP_PX = 60;                             // jump cap per frame after blink
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+
+async function tick(){
+  ctx.drawImage(cam, 0, 0, proc.width, proc.height);
+
+  const now = performance.now();
+  if (cam.currentTime !== lastVideoTime && faceLandmarker){
+    lastVideoTime = cam.currentTime;
+    const results = faceLandmarker.detectForVideo(cam, now);
+    lastResults = results;
+
+    if (results && results.faceLandmarks && results.faceLandmarks.length > 0){
+      const lm = results.faceLandmarks[0];
+
+      let u = computeCombinedFeature(lm);
+      const ear = computeEAR(lm);
+
+      // --- Extra smoothing while eyelids are closing (reduces "u" contribution)
+      const earSoftLow = BLINK_LOW * 1.15;
+      const earSoftHigh = BLINK_HIGH;
+      const sEye = clamp((ear - earSoftLow) / (earSoftHigh - earSoftLow), 0, 1);
+      u = [ lastU[0] + (u[0]-lastU[0]) * sEye, lastU[1] + (u[1]-lastU[1]) * sEye ];
+
+      // --- Blink detection (same, but add anchor and smooth exit)
+      if (!blinkState.closed && ear < BLINK_LOW) {
+        blinkState.closed = true;
+        blinkState.t0 = now;
+        blinkState.justClosed = true;
+        // Anchor current position (pre-filter after map) to freeze
+        const [ax, ay] = mapToScreen(lastU);
+        holdPos = {x: ax, y: ay};
+      } else if (blinkState.closed && ear > BLINK_HIGH) {
+        const dur = now - blinkState.t0;
+        blinkState.closed = false; blinkState.justClosed = false;
+        blinkState.cooldownUntil = now + BLINK_COOLDOWN_MS;
+        unfreezeUntil = now + UNFREEZE_MS; // smooth exit
+        if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS && (now - blinkState.lastConfirm) > 450) {
+          if (BLINK_CONFIRM) pendingBlinkSelect = true;
+          blinkState.lastConfirm = now;
+        }
+      }
+
+      // If blinking or in hard-freeze, keep previous feature
+      if (ear < EAR_FREEZE_XY || blinkState.closed){
+        u = lastU.slice();
+      }
+      lastU = u;
+
+      if (Number.isFinite(u[0]) && Number.isFinite(u[1])){
+        // map to screen
+        let [x,y] = mapToScreen(u);
+
+        // vertical OFFSET
+        y = clamp(y - GAZE_Y_LIFT_PX, 0, innerHeight);
+
+        // separated FILTERS
+        let xs = filterX.update(x);
+        let ys = filterY.update(y);
+
+        // Smooth exit from blink (avoid aggressive drop)
+        if (now < unfreezeUntil){
+          const t = 1 - ((unfreezeUntil - now) / UNFREEZE_MS);
+          xs = lerp(holdPos.x, xs, t);
+          ys = lerp(holdPos.y, ys, t);
+        }
+
+        // Limit max step per frame right after blink
+        if (now - (unfreezeUntil - UNFREEZE_MS) < 250){ // ~250ms after blink
+          const dx = xs - holdPos.x, dy = ys - holdPos.y;
+          const d = Math.hypot(dx, dy);
+          if (d > MAX_STEP_PX){
+            const k = MAX_STEP_PX / d;
+            xs = holdPos.x + dx * k;
+            ys = holdPos.y + dy * k;
+          }
+        }
+
+        xs = clamp(xs, 0, innerWidth);
+        ys = clamp(ys, 0, innerHeight);
+
+        updateDwell(xs, ys);
+
+        // Optional blink-confirm
+        if (pendingBlinkSelect) {
+          const target = blinkCandidate || findNearestKey(xs, ys, BLINK_RANGE, true);
+          if (target) { selectKey(target); target.classList.remove('active'); }
+          setBlinkCandidate(null);
+          hoverKey = null; hoverStart = 0; setCursor(xs, ys, 0);
+          pendingBlinkSelect = false;
+        }
+        if (blinkState.closed && blinkState.justClosed) {
+          const cand = findNearestKey(xs, ys, BLINK_RANGE, true);
+          setBlinkCandidate(cand);
+          blinkState.justClosed = false;
+        } else if (!blinkState.closed && now >= blinkState.cooldownUntil) {
+          setBlinkCandidate(null);
+        }
+      }
+    }
+  }
+
+  /* draw preview (video + trackers if SHOW_EYE_TRACKERS) */
+  drawToPreview();
+
+  requestAnimationFrame(tick);
+}
+
+/* -------------------------------------------------------------
+   14) BOOT
+   ------------------------------------------------------------- */
+async function boot(){
+  await startCamera();
+  statTxt.textContent='loading face landmarker…';
+  await loadLandmarker();
+  statTxt.textContent='running';
+  const saved = localStorage.getItem('calibTheta');
+  if(saved){ try{ theta = JSON.parse(saved); statTxt.textContent='running (calibrated ✓)'; }catch{} }
+  updatePredictions();
+  requestAnimationFrame(tick);
+}
+boot();
+
+/* Shortcuts */
+window.addEventListener('keydown', e=>{ if(e.key==='c') runCalibration(); });
+window.addEventListener('keydown', e=>{
+  if (e.key==='x'){
+    localStorage.removeItem('calibTheta');
+    theta = null;
+    statTxt.textContent = 'calibration cleared';
+  }
+});
+let previewVisible = true;
+window.addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  if(k==='v'){
+    previewVisible = !previewVisible;
+    document.getElementById('previewDock').style.display = previewVisible ? 'grid' : 'none';
+  }
+  if(k==='t'){
+    SHOW_EYE_TRACKERS = !SHOW_EYE_TRACKERS;
+    statTxt.textContent = SHOW_EYE_TRACKERS ? 'trackers ON' : 'trackers OFF';
+  }
+  // Fine-tune Y lift and persist
+  if(e.key === ']'){
+    GAZE_Y_LIFT_PX += 10;
+    localStorage.setItem('gazeYOffset', GAZE_Y_LIFT_PX);
+    statTxt.textContent = `Y lift: ${GAZE_Y_LIFT_PX}px`;
+  }
+  if(e.key === '['){
+    GAZE_Y_LIFT_PX = Math.max(0, GAZE_Y_LIFT_PX - 10);
+    localStorage.setItem('gazeYOffset', GAZE_Y_LIFT_PX);
+    statTxt.textContent = `Y lift: ${GAZE_Y_LIFT_PX}px`;
+  }
+});
+</script>
+</body>
+</html>
+
+
