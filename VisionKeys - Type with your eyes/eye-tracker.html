@@ -138,10 +138,10 @@ let typedBuffer = '';
 function renderTyped(){ typedTextEl.textContent = typedBuffer; }
 const wait = ms=>new Promise(r=>setTimeout(r,ms));
 
-/* ====== PREVIEW OPTIONS ====== */
+/* PREVIEW OPTIONS */
 let SHOW_EYE_TRACKERS = true; // ← draws eye contours + irises
 
-/* ====== CURSOR VERTICAL OFFSET (raises cursor on Y) ====== */
+/* CURSOR VERTICAL OFFSET (raises cursor on Y) */
 let GAZE_Y_LIFT_PX = Number(localStorage.getItem('gazeYOffset') || 120);
 
 /* Drawing helpers for preview */
